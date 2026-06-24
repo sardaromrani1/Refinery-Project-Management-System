@@ -23,11 +23,27 @@ Notes
   row is selected for Update/Delete.
 • Equipment_Tag is a foreign key, presented as a read-only Combobox populated
   live from EQUIPMENT ("Equipment_Tag - Description"), optional.
+
+Search behaviour (added to match projects_form.py / equipment_form.py)
+────────────────────────────────────────────────────────────────────────
+• Column-scoped search: user picks which column to search (Inspection ID,
+  Equipment Tag, Inspection Date, Inspection Type, Result, Inspector) via a
+  dropdown next to the search box.
+• Text columns use a keyword LIKE search.
+• "Inspection Date" uses a date-range search (From / To tkcalendar.DateEntry
+  pickers) instead of a keyword box, same as projects_form.py / equipment_form.py.
+• The Inspection_Date entry field in the details panel is now a DateEntry
+  calendar picker (was a free-typed "YYYY-MM-DD" Entry) for consistency.
+
+Requires the 'tkcalendar' package:
+    pip install tkcalendar
 """
 
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
+
+from tkcalendar import DateEntry
 
 from db_connection import get_connection
 
@@ -37,6 +53,19 @@ INSPECTION_TYPE_OPTIONS = ["Visual", "Ultrasonic Thickness", "Pressure Test",
                            "Functional Test", "Safety", "Regulatory", "Other"]
 RESULT_OPTIONS = ["Pass", "Fail", "Conditional Pass", "Pending"]
 
+# ── Search column options: display label -> actual SQL column name ──────────
+SEARCH_COLUMNS = {
+    "Inspection ID": "Inspection_ID",
+    "Equipment Tag": "Equipment_Tag",
+    "Inspection Date": "Inspection_Date",
+    "Inspection Type": "Inspection_Type",
+    "Result": "Result",
+    "Inspector": "Inspector",
+}
+
+# Columns that use a date-range search (From / To calendars) instead of a keyword box
+DATE_RANGE_COLUMNS = {"Inspection Date": "Inspection_Date"}
+
 
 # ────────────────────────────────────────────────────────────────────────────
 class InspectionsForm(tk.Frame):
@@ -45,6 +74,8 @@ class InspectionsForm(tk.Frame):
       • A data-entry panel (top)
       • CRUD buttons
       • A searchable, sortable Treeview listing all inspections
+      • Column-scoped search: keyword search for text columns, date-range
+        search (From/To calendars) for Inspection Date
     """
 
     BG = "#1e2327"
@@ -74,19 +105,41 @@ class InspectionsForm(tk.Frame):
             font=("Segoe UI", 16, "bold")
         ).pack(pady=(18, 6))
 
-        # ── Search bar ────────────────────────────────────────────────────────
+        # ── Search bar (column selector + dynamic keyword/date-range area) ───
         search_frame = tk.Frame(self, bg=self.BG)
         search_frame.pack(fill=tk.X, padx=20, pady=(0, 6))
 
-        tk.Label(search_frame, text="Search:", bg=self.BG, fg=self.FG,
+        tk.Label(search_frame, text="Search by:", bg=self.BG, fg=self.FG,
                  font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
+
+        self.search_column_var = tk.StringVar(value="Inspector")
+        search_column_combo = ttk.Combobox(
+            search_frame, textvariable=self.search_column_var,
+            values=list(SEARCH_COLUMNS.keys()), state="readonly",
+            font=("Segoe UI", 10), width=14
+        )
+        search_column_combo.pack(side=tk.LEFT, padx=(0, 10))
+        # Rebuild the search input area (keyword box vs. date-range pickers)
+        # whenever the chosen column changes, then re-run the search.
+        search_column_combo.bind("<<ComboboxSelected>>", self._on_search_column_change)
+
+        # Container that holds either the keyword Entry OR the From/To DateEntry pair.
+        # Its contents are swapped dynamically by _on_search_column_change().
+        self.search_input_frame = tk.Frame(search_frame, bg=self.BG)
+        self.search_input_frame.pack(side=tk.LEFT)
+
+        # Keyword search variable (used for text columns)
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self.load_inspections())
-        tk.Entry(
-            search_frame, textvariable=self.search_var,
-            bg=self.ENTRY_BG, fg=self.FG, insertbackground=self.FG,
-            relief=tk.FLAT, font=("Segoe UI", 10), width=30
-        ).pack(side=tk.LEFT)
+
+        # Date-range widgets are created on demand in _build_keyword_search() /
+        # _build_date_range_search(); references stored here once created.
+        self._search_keyword_entry = None
+        self._search_date_from = None
+        self._search_date_to = None
+
+        # Build the initial search input (default column is "Inspector" -> keyword box)
+        self._build_keyword_search()
 
         # ── Entry panel ───────────────────────────────────────────────────────
         panel = tk.LabelFrame(
@@ -100,7 +153,7 @@ class InspectionsForm(tk.Frame):
         col0_fields = [
             ("Inspection_ID *", "entry"),
             ("Equipment_Tag", "fk_equipment"),
-            ("Inspection_Date (YYYY-MM-DD)", "entry"),
+            ("Inspection_Date", "date"),
         ]
         col1_fields = [
             ("Inspection_Type", "combo_type"),
@@ -188,6 +241,17 @@ class InspectionsForm(tk.Frame):
         elif kind == "combo_result":
             widget = ttk.Combobox(panel, values=RESULT_OPTIONS, state="normal",
                                   font=("Segoe UI", 10), width=26)
+        elif kind == "date":
+            # Calendar date picker, same style as projects_form.py / equipment_form.py.
+            widget = DateEntry(
+                panel, date_pattern="yyyy-mm-dd",
+                font=("Segoe UI", 10), width=25,
+                background=self.ACCENT, foreground="#ffffff",
+                borderwidth=0, state="readonly"
+            )
+            # Blank by default — DateEntry defaults to "today"; Inspection_Date
+            # should start empty rather than assume today's date.
+            widget.delete(0, tk.END)
         else:
             raise ValueError(f"Unknown field kind: {kind}")
 
@@ -227,6 +291,80 @@ class InspectionsForm(tk.Frame):
         self._refresh_equipment_options()
         self.load_inspections()
 
+    # ── Search-input builders ──────────────────────────────────────────────
+    def _clear_search_input_frame(self):
+        for child in self.search_input_frame.winfo_children():
+            child.destroy()
+        self._search_keyword_entry = None
+        self._search_date_from = None
+        self._search_date_to = None
+
+    def _build_keyword_search(self):
+        """Show a single keyword Entry (used for ID / Tag / Type / Result /
+        Inspector search)."""
+        self._clear_search_input_frame()
+
+        tk.Label(self.search_input_frame, text="Keyword:", bg=self.BG, fg=self.FG,
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
+
+        self.search_var.set("") # reset previous keyword
+        self._search_keyword_entry = tk.Entry(
+            self.search_input_frame, textvariable=self.search_var,
+            bg=self.ENTRY_BG, fg=self.FG, insertbackground=self.FG,
+            relief=tk.FLAT, font=("Segoe UI", 10), width=30
+        )
+        self._search_keyword_entry.pack(side=tk.LEFT)
+
+    def _build_date_range_search(self):
+        """Show two calendar pickers: 'From' and 'To' (used for Inspection Date search)."""
+        self._clear_search_input_frame()
+
+        tk.Label(self.search_input_frame, text="From:", bg=self.BG, fg=self.FG,
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
+        self._search_date_from = DateEntry(
+            self.search_input_frame, date_pattern="yyyy-mm-dd",
+            font=("Segoe UI", 10), width=12,
+            background=self.ACCENT, foreground="#ffffff",
+            borderwidth=0, state="readonly"
+        )
+        self._search_date_from.delete(0, tk.END) # start blank
+        self._search_date_from.pack(side=tk.LEFT, padx=(0, 10))
+        self._search_date_from.bind("<<DateEntrySelected>>", lambda _e: self.load_inspections())
+
+        tk.Label(self.search_input_frame, text="To:", bg=self.BG, fg=self.FG,
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
+        self._search_date_to = DateEntry(
+            self.search_input_frame, date_pattern="yyyy-mm-dd",
+            font=("Segoe UI", 10), width=12,
+            background=self.ACCENT, foreground="#ffffff",
+            borderwidth=0, state="readonly"
+        )
+        self._search_date_to.delete(0, tk.END) # start blank
+        self._search_date_to.pack(side=tk.LEFT)
+        self._search_date_to.bind("<<DateEntrySelected>>", lambda _e: self.load_inspections())
+
+        # Small "Clear dates" button so the user can reset without retyping
+        tk.Button(
+            self.search_input_frame, text="✖", command=self._clear_date_range,
+            bg=self.BTN_BG, fg=self.BTN_FG, activebackground="#0096c7",
+            relief=tk.FLAT, font=("Segoe UI", 9, "bold"), width=2, cursor="hand2"
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+    def _clear_date_range(self):
+        if self._search_date_from is not None:
+            self._search_date_from.delete(0, tk.END)
+        if self._search_date_to is not None:
+            self._search_date_to.delete(0, tk.END)
+        self.load_inspections()
+
+    def _on_search_column_change(self, _event=None):
+        column_label = self.search_column_var.get()
+        if column_label in DATE_RANGE_COLUMNS:
+            self._build_date_range_search()
+        else:
+            self._build_keyword_search()
+        self.load_inspections()
+
     # ── Helpers ───────────────────────────────────────────────────────────────
     def _get_field(self, label: str) -> str:
         return self._entries[label].get().strip()
@@ -242,7 +380,9 @@ class InspectionsForm(tk.Frame):
             messagebox.showwarning("Validation", "Inspection_ID is required.")
             return False
 
-        val = self._get_field("Inspection_Date (YYYY-MM-DD)")
+        # DateEntry already enforces yyyy-mm-dd formatting via the calendar,
+        # but we still guard against a manually-cleared/blank field here.
+        val = self._get_field("Inspection_Date")
         if val:
             try:
                 datetime.strptime(val, DATE_FMT)
@@ -258,12 +398,21 @@ class InspectionsForm(tk.Frame):
     def _none_if_empty(self, val: str):
         return val if val else None
 
+    def _set_date_field(self, label: str, value):
+        """Set a DateEntry field's text directly (value may be a date string or empty)."""
+        widget = self._entries[label]
+        widget.delete(0, tk.END)
+        if value:
+            widget.insert(0, value)
+
     def clear_fields(self):
         self._selected_id = None
         self._entries["Inspection_ID *"].configure(state="normal")
         for lbl, widget in self._entries.items():
             if isinstance(widget, ttk.Combobox):
                 widget.set("")
+            elif isinstance(widget, DateEntry):
+                widget.delete(0, tk.END)
             else:
                 widget.delete(0, tk.END)
         self.tree.selection_remove(self.tree.selection())
@@ -287,8 +436,7 @@ class InspectionsForm(tk.Frame):
             self._equipment_id_to_display.get(equip_tag, "") if equip_tag else ""
         )
 
-        self._entries["Inspection_Date (YYYY-MM-DD)"].delete(0, tk.END)
-        self._entries["Inspection_Date (YYYY-MM-DD)"].insert(0, values[2] if values[2] else "")
+        self._set_date_field("Inspection_Date", values[2] if values[2] else "")
 
         self._entries["Inspection_Type"].set(values[3] if values[3] else "")
         self._entries["Result"].set(values[4] if values[4] else "")
@@ -305,30 +453,64 @@ class InspectionsForm(tk.Frame):
 
     # ── CRUD ──────────────────────────────────────────────────────────────────
     def load_inspections(self, *_):
+        """Read inspections, filtered by the selected column, into the treeview.
+
+        Text columns (ID / Tag / Type / Result / Inspector) use a keyword LIKE
+        search. Inspection Date uses a From/To range search.
+        """
         for row in self.tree.get_children():
             self.tree.delete(row)
 
-        keyword = self.search_var.get().strip()
+        column_label = self.search_column_var.get()
+        sql_column = SEARCH_COLUMNS.get(column_label, "Inspector")
+        keyword_active = False
+        rows = []
+
         try:
             conn = get_connection()
             cursor = conn.cursor()
 
-            if keyword:
-                cursor.execute(
-                    "SELECT Inspection_ID, Equipment_Tag, Inspection_Date, "
-                    "Inspection_Type, Result, Inspector FROM INSPECTIONS "
-                    "WHERE Inspection_Type LIKE ? OR Result LIKE ? OR Inspector LIKE ? "
-                    "ORDER BY Inspection_ID",
-                    (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%")
-                )
-            else:
-                cursor.execute(
-                    "SELECT Inspection_ID, Equipment_Tag, Inspection_Date, "
-                    "Inspection_Type, Result, Inspector FROM INSPECTIONS "
-                    "ORDER BY Inspection_ID"
-                )
+            if column_label in DATE_RANGE_COLUMNS:
+                date_from = self._search_date_from.get().strip() if self._search_date_from else ""
+                date_to = self._search_date_to.get().strip() if self._search_date_to else ""
 
-            for row in cursor.fetchall():
+                conditions, params = [], []
+                if date_from:
+                    conditions.append(f"{sql_column} >= ?")
+                    params.append(date_from)
+                if date_to:
+                    conditions.append(f"{sql_column} <= ?")
+                    params.append(date_to)
+
+                where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+                cursor.execute(
+                    "SELECT Inspection_ID, Equipment_Tag, Inspection_Date, "
+                    "Inspection_Type, Result, Inspector FROM INSPECTIONS" + where_clause +
+                    " ORDER BY Inspection_ID",
+                    params
+                )
+                keyword_active = bool(conditions)
+
+            else:
+                keyword = self.search_var.get().strip()
+                keyword_active = bool(keyword)
+
+                if keyword:
+                    cursor.execute(
+                        f"SELECT Inspection_ID, Equipment_Tag, Inspection_Date, "
+                        f"Inspection_Type, Result, Inspector FROM INSPECTIONS "
+                        f"WHERE {sql_column} LIKE ? ORDER BY Inspection_ID",
+                        (f"%{keyword}%",)
+                    )
+                else:
+                    cursor.execute(
+                        "SELECT Inspection_ID, Equipment_Tag, Inspection_Date, "
+                        "Inspection_Type, Result, Inspector FROM INSPECTIONS "
+                        "ORDER BY Inspection_ID"
+                    )
+
+            rows = cursor.fetchall()
+            for row in rows:
                 insp_date = str(row[2])[:10] if row[2] else ""
                 self.tree.insert("", tk.END, values=(
                     row[0], row[1] or "", insp_date, row[3] or "",
@@ -336,6 +518,9 @@ class InspectionsForm(tk.Frame):
                 ))
 
             conn.close()
+
+            if keyword_active and not rows:
+                messagebox.showinfo("Search", "No inspections matched your search criteria.")
 
         except Exception as exc:
             messagebox.showerror("Database Error", f"Failed to load inspections:\n{exc}")
@@ -346,7 +531,7 @@ class InspectionsForm(tk.Frame):
 
         insp_id = self._get_field("Inspection_ID *")
         equip_tag = self._equipment_id_from_field()
-        insp_date = self._none_if_empty(self._get_field("Inspection_Date (YYYY-MM-DD)"))
+        insp_date = self._none_if_empty(self._get_field("Inspection_Date"))
         insp_type = self._none_if_empty(self._get_field("Inspection_Type"))
         result = self._none_if_empty(self._get_field("Result"))
         inspector = self._none_if_empty(self._get_field("Inspector"))
@@ -376,7 +561,7 @@ class InspectionsForm(tk.Frame):
             return
 
         equip_tag = self._equipment_id_from_field()
-        insp_date = self._none_if_empty(self._get_field("Inspection_Date (YYYY-MM-DD)"))
+        insp_date = self._none_if_empty(self._get_field("Inspection_Date"))
         insp_type = self._none_if_empty(self._get_field("Inspection_Type"))
         result = self._none_if_empty(self._get_field("Result"))
         inspector = self._none_if_empty(self._get_field("Inspector"))

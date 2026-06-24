@@ -31,15 +31,44 @@ Notes
   human-readable name column called "Contractor_Name". If your contractors_form.py
   uses a different column name for that, update the SELECT statement in
   `_refresh_contractor_options()` below to match.
+
+Changes in this revision
+─────────────────────────
+• Column-scoped search added (same pattern as projects_form.py): a dropdown
+  lets the user choose which column to search — Resource ID, Activity ID,
+  Contractor ID, Name, Role, Certification, Assigned From, Assigned To.
+• Assigned From / Assigned To use a date-range search (From/To calendar
+  pickers via tkcalendar.DateEntry) instead of a keyword box.
+• All other columns keep the plain keyword LIKE search.
+
+Requires the 'tkcalendar' package:
+    pip install tkcalendar
 """
 
 import tkinter as tk
 from tkinter import ttk, messagebox
 from datetime import datetime
 
+from tkcalendar import DateEntry
+
 from db_connection import get_connection
 
 DATE_FMT = "%Y-%m-%d"
+
+# ── Search column options: display label -> actual SQL column name ──────────
+SEARCH_COLUMNS = {
+    "Resource ID": "Resource_ID",
+    "Activity ID": "Activity_ID",
+    "Contractor ID": "Contractor_ID",
+    "Name": "Name",
+    "Role": "Role",
+    "Certification": "Certification",
+    "Assigned From": "Assigned_From",
+    "Assigned To": "Assigned_To",
+}
+
+# Columns that use a date-range search (From / To calendars) instead of a keyword box
+DATE_RANGE_COLUMNS = {"Assigned From": "Assigned_From", "Assigned To": "Assigned_To"}
 
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -49,6 +78,8 @@ class ResourcesForm(tk.Frame):
       • A data-entry panel (top)
       • CRUD buttons
       • A searchable, sortable Treeview listing all resources
+      • Column-scoped search: keyword search for text/ID columns, date-range
+        search (From/To calendars) for Assigned From / Assigned To
     """
 
     BG = "#1e2327"
@@ -81,19 +112,41 @@ class ResourcesForm(tk.Frame):
             font=("Segoe UI", 16, "bold")
         ).pack(pady=(18, 6))
 
-        # ── Search bar ────────────────────────────────────────────────────────
+        # ── Search bar (column selector + dynamic keyword/date-range area) ───
         search_frame = tk.Frame(self, bg=self.BG)
         search_frame.pack(fill=tk.X, padx=20, pady=(0, 6))
 
-        tk.Label(search_frame, text="Search:", bg=self.BG, fg=self.FG,
+        tk.Label(search_frame, text="Search by:", bg=self.BG, fg=self.FG,
                  font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
+
+        self.search_column_var = tk.StringVar(value="Name")
+        search_column_combo = ttk.Combobox(
+            search_frame, textvariable=self.search_column_var,
+            values=list(SEARCH_COLUMNS.keys()), state="readonly",
+            font=("Segoe UI", 10), width=14
+        )
+        search_column_combo.pack(side=tk.LEFT, padx=(0, 10))
+        # Rebuild the search input area (keyword box vs. date-range pickers)
+        # whenever the chosen column changes, then re-run the search.
+        search_column_combo.bind("<<ComboboxSelected>>", self._on_search_column_change)
+
+        # Container that holds either the keyword Entry OR the From/To DateEntry pair.
+        # Its contents are swapped dynamically by _on_search_column_change().
+        self.search_input_frame = tk.Frame(search_frame, bg=self.BG)
+        self.search_input_frame.pack(side=tk.LEFT)
+
+        # Keyword search variable (used for ID / Name / Role / Certification columns)
         self.search_var = tk.StringVar()
         self.search_var.trace_add("write", lambda *_: self.load_resources())
-        tk.Entry(
-            search_frame, textvariable=self.search_var,
-            bg=self.ENTRY_BG, fg=self.FG, insertbackground=self.FG,
-            relief=tk.FLAT, font=("Segoe UI", 10), width=30
-        ).pack(side=tk.LEFT)
+
+        # Date-range widgets are created on demand in _build_keyword_search() /
+        # _build_date_range_search(); references stored here once created.
+        self._search_keyword_entry = None
+        self._search_date_from = None
+        self._search_date_to = None
+
+        # Build the initial search input (default column is "Name" -> keyword box)
+        self._build_keyword_search()
 
         # ── Entry panel ───────────────────────────────────────────────────────
         panel = tk.LabelFrame(
@@ -113,8 +166,8 @@ class ResourcesForm(tk.Frame):
         col1_fields = [
             ("Role", "entry"),
             ("Certification", "entry"),
-            ("Assigned_From (YYYY-MM-DD)", "entry"),
-            ("Assigned_To (YYYY-MM-DD)", "entry"),
+            ("Assigned_From", "date"),
+            ("Assigned_To", "date"),
         ]
 
         for i, (lbl, kind) in enumerate(col0_fields):
@@ -191,11 +244,95 @@ class ResourcesForm(tk.Frame):
             widget = ttk.Combobox(panel, values=[""], state="readonly",
                                   font=("Segoe UI", 10), width=26)
             widget.set("")
+        elif kind == "date":
+            # Calendar date picker. date_pattern controls the .get() string format.
+            widget = DateEntry(
+                panel, date_pattern="yyyy-mm-dd",
+                font=("Segoe UI", 10), width=25,
+                background=self.ACCENT, foreground="#ffffff",
+                borderwidth=0, state="readonly"
+            )
+            # Blank by default — DateEntry defaults to "today"; dates are
+            # optional here, so the form should start empty.
+            widget.delete(0, tk.END)
         else:
             raise ValueError(f"Unknown field kind: {kind}")
 
         widget.grid(row=row, column=col + 1, padx=14, pady=5, sticky="w")
         self._entries[label] = widget
+
+    # ── Search-input builders ──────────────────────────────────────────────
+    def _clear_search_input_frame(self):
+        for child in self.search_input_frame.winfo_children():
+            child.destroy()
+        self._search_keyword_entry = None
+        self._search_date_from = None
+        self._search_date_to = None
+
+    def _build_keyword_search(self):
+        """Show a single keyword Entry (used for ID / Name / Role / Certification search)."""
+        self._clear_search_input_frame()
+
+        tk.Label(self.search_input_frame, text="Keyword:", bg=self.BG, fg=self.FG,
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
+
+        self.search_var.set("") # reset previous keyword
+        self._search_keyword_entry = tk.Entry(
+            self.search_input_frame, textvariable=self.search_var,
+            bg=self.ENTRY_BG, fg=self.FG, insertbackground=self.FG,
+            relief=tk.FLAT, font=("Segoe UI", 10), width=30
+        )
+        self._search_keyword_entry.pack(side=tk.LEFT)
+
+    def _build_date_range_search(self):
+        """Show two calendar pickers: 'From' and 'To' (used for date-column search)."""
+        self._clear_search_input_frame()
+
+        tk.Label(self.search_input_frame, text="From:", bg=self.BG, fg=self.FG,
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
+        self._search_date_from = DateEntry(
+            self.search_input_frame, date_pattern="yyyy-mm-dd",
+            font=("Segoe UI", 10), width=12,
+            background=self.ACCENT, foreground="#ffffff",
+            borderwidth=0, state="readonly"
+        )
+        self._search_date_from.delete(0, tk.END) # start blank
+        self._search_date_from.pack(side=tk.LEFT, padx=(0, 10))
+        self._search_date_from.bind("<<DateEntrySelected>>", lambda _e: self.load_resources())
+
+        tk.Label(self.search_input_frame, text="To:", bg=self.BG, fg=self.FG,
+                 font=("Segoe UI", 10)).pack(side=tk.LEFT, padx=(0, 6))
+        self._search_date_to = DateEntry(
+            self.search_input_frame, date_pattern="yyyy-mm-dd",
+            font=("Segoe UI", 10), width=12,
+            background=self.ACCENT, foreground="#ffffff",
+            borderwidth=0, state="readonly"
+        )
+        self._search_date_to.delete(0, tk.END) # start blank
+        self._search_date_to.pack(side=tk.LEFT)
+        self._search_date_to.bind("<<DateEntrySelected>>", lambda _e: self.load_resources())
+
+        # Small "Clear dates" button so the user can reset without retyping
+        tk.Button(
+            self.search_input_frame, text="✖", command=self._clear_date_range,
+            bg=self.BTN_BG, fg=self.BTN_FG, activebackground="#0096c7",
+            relief=tk.FLAT, font=("Segoe UI", 9, "bold"), width=2, cursor="hand2"
+        ).pack(side=tk.LEFT, padx=(8, 0))
+
+    def _clear_date_range(self):
+        if self._search_date_from is not None:
+            self._search_date_from.delete(0, tk.END)
+        if self._search_date_to is not None:
+            self._search_date_to.delete(0, tk.END)
+        self.load_resources()
+
+    def _on_search_column_change(self, _event=None):
+        column_label = self.search_column_var.get()
+        if column_label in DATE_RANGE_COLUMNS:
+            self._build_date_range_search()
+        else:
+            self._build_keyword_search()
+        self.load_resources()
 
     # ── FK loading ───────────────────────────────────────────────────────────
     def _refresh_activity_options(self):
@@ -285,7 +422,9 @@ class ResourcesForm(tk.Frame):
             messagebox.showwarning("Validation", "Name is required.")
             return False
 
-        for lbl in ("Assigned_From (YYYY-MM-DD)", "Assigned_To (YYYY-MM-DD)"):
+        # DateEntry already enforces yyyy-mm-dd formatting via the calendar,
+        # but we still guard against a manually-cleared/blank field here.
+        for lbl in ("Assigned_From", "Assigned_To"):
             val = self._get_field(lbl)
             if val:
                 try:
@@ -297,8 +436,8 @@ class ResourcesForm(tk.Frame):
                     )
                     return False
 
-        start = self._get_field("Assigned_From (YYYY-MM-DD)")
-        end = self._get_field("Assigned_To (YYYY-MM-DD)")
+        start = self._get_field("Assigned_From")
+        end = self._get_field("Assigned_To")
         if start and end and start > end:
             messagebox.showwarning("Validation", "Assigned From cannot be after Assigned To.")
             return False
@@ -317,6 +456,13 @@ class ResourcesForm(tk.Frame):
             else:
                 widget.delete(0, tk.END)
         self.tree.selection_remove(self.tree.selection())
+
+    def _set_date_field(self, label: str, value):
+        """Set a DateEntry field's text directly (value may be a date string or empty)."""
+        widget = self._entries[label]
+        widget.delete(0, tk.END)
+        if value:
+            widget.insert(0, value)
 
     def _on_row_select(self, _event=None):
         selected = self.tree.selection()
@@ -351,11 +497,8 @@ class ResourcesForm(tk.Frame):
         self._entries["Certification"].delete(0, tk.END)
         self._entries["Certification"].insert(0, values[5] if values[5] else "")
 
-        self._entries["Assigned_From (YYYY-MM-DD)"].delete(0, tk.END)
-        self._entries["Assigned_From (YYYY-MM-DD)"].insert(0, values[6] if values[6] else "")
-
-        self._entries["Assigned_To (YYYY-MM-DD)"].delete(0, tk.END)
-        self._entries["Assigned_To (YYYY-MM-DD)"].insert(0, values[7] if values[7] else "")
+        self._set_date_field("Assigned_From", values[6] if values[6] else "")
+        self._set_date_field("Assigned_To", values[7] if values[7] else "")
 
     def _sort_tree(self, col: str, reverse: bool):
         data = [(self.tree.set(k, col), k) for k in self.tree.get_children("")]
@@ -366,30 +509,60 @@ class ResourcesForm(tk.Frame):
 
     # ── CRUD ──────────────────────────────────────────────────────────────────
     def load_resources(self, *_):
+        """Read resources, filtered by the selected column, into the treeview.
+
+        Text/ID columns use a keyword LIKE search.
+        Date columns (Assigned From / Assigned To) use a From/To range search.
+        """
         for row in self.tree.get_children():
             self.tree.delete(row)
 
-        keyword = self.search_var.get().strip()
+        column_label = self.search_column_var.get()
+        sql_column = SEARCH_COLUMNS.get(column_label, "Name")
+        keyword_active = False
+
         try:
             conn = get_connection()
             cursor = conn.cursor()
 
-            if keyword:
-                cursor.execute(
-                    "SELECT Resource_ID, Activity_ID, Contractor_ID, Name, Role, "
-                    "Certification, Assigned_From, Assigned_To FROM RESOURCES "
-                    "WHERE Name LIKE ? OR Role LIKE ? OR Certification LIKE ? "
-                    "ORDER BY Resource_ID",
-                    (f"%{keyword}%", f"%{keyword}%", f"%{keyword}%")
-                )
-            else:
-                cursor.execute(
-                    "SELECT Resource_ID, Activity_ID, Contractor_ID, Name, Role, "
-                    "Certification, Assigned_From, Assigned_To FROM RESOURCES "
-                    "ORDER BY Resource_ID"
-                )
+            base_select = (
+                "SELECT Resource_ID, Activity_ID, Contractor_ID, Name, Role, "
+                "Certification, Assigned_From, Assigned_To FROM RESOURCES"
+            )
 
-            for row in cursor.fetchall():
+            if column_label in DATE_RANGE_COLUMNS:
+                date_from = self._search_date_from.get().strip() if self._search_date_from else ""
+                date_to = self._search_date_to.get().strip() if self._search_date_to else ""
+
+                conditions, params = [], []
+                if date_from:
+                    conditions.append(f"{sql_column} >= ?")
+                    params.append(date_from)
+                if date_to:
+                    conditions.append(f"{sql_column} <= ?")
+                    params.append(date_to)
+
+                where_clause = (" WHERE " + " AND ".join(conditions)) if conditions else ""
+                cursor.execute(
+                    base_select + where_clause + " ORDER BY Resource_ID",
+                    params
+                )
+                keyword_active = bool(conditions)
+
+            else:
+                keyword = self.search_var.get().strip()
+                keyword_active = bool(keyword)
+
+                if keyword:
+                    cursor.execute(
+                        f"{base_select} WHERE {sql_column} LIKE ? ORDER BY Resource_ID",
+                        (f"%{keyword}%",)
+                    )
+                else:
+                    cursor.execute(base_select + " ORDER BY Resource_ID")
+
+            rows = cursor.fetchall()
+            for row in rows:
                 a_from = str(row[6])[:10] if row[6] else ""
                 a_to = str(row[7])[:10] if row[7] else ""
                 self.tree.insert("", tk.END, values=(
@@ -398,6 +571,9 @@ class ResourcesForm(tk.Frame):
                 ))
 
             conn.close()
+
+            if keyword_active and not rows:
+                messagebox.showinfo("Search", "No resources matched your search criteria.")
 
         except Exception as exc:
             messagebox.showerror("Database Error", f"Failed to load resources:\n{exc}")
@@ -412,8 +588,8 @@ class ResourcesForm(tk.Frame):
         name = self._get_field("Name *")
         role = self._none_if_empty(self._get_field("Role"))
         cert = self._none_if_empty(self._get_field("Certification"))
-        a_from = self._none_if_empty(self._get_field("Assigned_From (YYYY-MM-DD)"))
-        a_to = self._none_if_empty(self._get_field("Assigned_To (YYYY-MM-DD)"))
+        a_from = self._none_if_empty(self._get_field("Assigned_From"))
+        a_to = self._none_if_empty(self._get_field("Assigned_To"))
 
         try:
             conn = get_connection()
@@ -445,8 +621,8 @@ class ResourcesForm(tk.Frame):
         name = self._get_field("Name *")
         role = self._none_if_empty(self._get_field("Role"))
         cert = self._none_if_empty(self._get_field("Certification"))
-        a_from = self._none_if_empty(self._get_field("Assigned_From (YYYY-MM-DD)"))
-        a_to = self._none_if_empty(self._get_field("Assigned_To (YYYY-MM-DD)"))
+        a_from = self._none_if_empty(self._get_field("Assigned_From"))
+        a_to = self._none_if_empty(self._get_field("Assigned_To"))
 
         if not messagebox.askyesno("Confirm Update",
                                    f"Update Resource '{self._selected_id}'?"):
@@ -499,7 +675,7 @@ class ResourcesForm(tk.Frame):
 if __name__ == "__main__":
     root = tk.Tk()
     root.title("Refinery Project – Resources Form")
-    root.geometry("1050x650")
+    root.geometry("1050x680")
     root.configure(bg="#1e2327")
     ResourcesForm(root)
     root.mainloop()

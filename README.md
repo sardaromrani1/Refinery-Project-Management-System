@@ -1,8 +1,8 @@
-# Refinery_Project_Python
+# Refinery-Project-Management-System
 
 ## Overview
 
-**Refinery_Project_Python** is a Python-based desktop application developed for managing refinery engineering and maintenance project data. The application provides a graphical user interface (GUI) built with Tkinter and communicates with a Microsoft SQL Server database through ODBC.
+**Refinery-Project-Management-System** is a Python-based desktop application developed for managing refinery engineering and maintenance project data. The application provides a graphical user interface (GUI) built with Tkinter and communicates with a Microsoft SQL Server database through ODBC.
 
 The system implements a modular architecture in which each database table is managed through its own dedicated form. It supports efficient data entry, modification, retrieval, and maintenance while providing a user-friendly interface suitable for engineering and maintenance departments.
 
